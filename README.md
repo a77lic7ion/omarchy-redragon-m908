@@ -1,5 +1,8 @@
 # Redragon M908
 
+<img width="565" height="513" alt="image" src="https://github.com/user-attachments/assets/f83b1dc4-136b-4c79-8f17-7b82b7bdf04f" />
+
+
 A bar widget for the [Omarchy](https://omarchy.org) Quattro shell that maps the 13 remappable buttons on the Redragon M908 gaming mouse and switches between named profiles.
 
 Plugin id: `redragon-m908`

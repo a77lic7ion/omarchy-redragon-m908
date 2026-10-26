@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+"""
+m908d — Redragon M908 remapping daemon.
+
+Runs as a systemd --user service. Owns the device grab, the profile store and
+a JSON-over-Unix-socket control API used by the QML plugin and the CLI.
+
+Socket: $XDG_RUNTIME_DIR/m908.sock
+Protocol: one JSON object per line, one JSON object per line back.
+  {"op": "status"}
+  {"op": "profiles.list"}
+  {"op": "profile.load", "slug": "gaming"}
+  {"op": "profile.save", "slug": "gaming", "buttons": {...}}
+  {"op": "profile.new", "name": "Gaming", "base": "default"}
+  {"op": "profile.delete", "slug": "gaming"}
+  {"op": "button.set", "button": "side_1", "type": "key", "value": 30}
+  {"op": "capture"}        -> begins capturing the next key pressed
+  {"op": "capture.poll"}   -> {"captured": <code|null>}
+  {"op": "revert"}
+"""
+
+import json
+import os
+import signal
+import socket
+import sys
+import threading
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import profiles as prof  # noqa: E402
+from backend import EV_KEY, SoftwareBackend  # noqa: E402
+from buttonmap import BUTTON_LABELS, BUTTON_ORDER, key_name  # noqa: E402
+
+DAEMON_VERSION = "1.0.0"
+
+SOCKET_PATH = os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "m908.sock"
+)
+
+_running = True
+_state_lock = threading.Lock()
+_capture_mode = None      # None | "key" | "button"
+_captured = None
+
+
+def log(*a):
+    print("[m908d]", *a, file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------------------
+# capture support: learn a new keycode by watching the device
+# ---------------------------------------------------------------------------
+
+def _capture_hook(code):
+    """Return True to consume the event (capture mode), False to let it through."""
+    global _captured
+    if not _capture_mode:
+        return False
+    _captured = int(code)
+    log(f"captured code {code} ({key_name(code)})")
+    return True
+
+
+def _button_for_code(code):
+    """Map a physical source code back to its canonical button id."""
+    from buttonmap import default_profile_buttons
+    for bid, action in default_profile_buttons().items():
+        if int(action.get("value")) == int(code):
+            return bid
+    return None
+
+
+# ---------------------------------------------------------------------------
+# request handling
+# ---------------------------------------------------------------------------
+
+def describe(buttons):
+    """Make the button map UI-friendly."""
+    out = {}
+    for bid in BUTTON_ORDER:
+        action = (buttons or {}).get(bid)
+        if not isinstance(action, dict):
+            out[bid] = {"label": BUTTON_LABELS[bid], "type": "disabled",
+                        "value": None, "display": "Disabled"}
+            continue
+        atype = action.get("type", "disabled")
+        val = action.get("value")
+        if atype == "key":
+            out[bid] = {"label": BUTTON_LABELS[bid], "type": "key",
+                        "value": val, "display": key_name(val)}
+        elif atype == "combo":
+            codes = val or []
+            out[bid] = {"label": BUTTON_LABELS[bid], "type": "combo",
+                        "value": codes,
+                        "display": " + ".join(key_name(c) for c in codes) or "Disabled"}
+        elif atype == "mouse":
+            out[bid] = {"label": BUTTON_LABELS[bid], "type": "mouse",
+                        "value": val, "display": key_name(val)}
+        else:
+            out[bid] = {"label": BUTTON_LABELS[bid], "type": atype,
+                        "value": val, "display": str(val) if val else atype.title()}
+    return out
+
+
+class Service:
+    def __init__(self):
+        self.backend = None
+        self.active = None
+        self.buttons = {}
+        self._logged_missing = False
+
+    def start_backend(self):
+        node = SoftwareBackend.find_keypad_node()
+        if not node:
+            if not self._logged_missing:
+                log("no M908 keypad node found - is the mouse plugged in?")
+                self._logged_missing = True
+            return False
+        try:
+            self.backend = SoftwareBackend(node, log=log)
+            self.backend.capture_cb = _capture_hook
+            self.backend.open_source()
+            self.backend.open_uinput()
+        except (OSError, IOError) as e:
+            log(f"backend start failed: {e}")
+            self.backend = None
+            return False
+        self._logged_missing = False
+        return True
+
+    def apply(self, slug):
+        data = prof.load(slug)
+        problems = prof.validate(data)
+        if problems:
+            raise ValueError("; ".join(problems))
+        self.active = slug
+        self.buttons = data.get("buttons", {})
+        prof.set_active(slug)
+        if self.backend:
+            self.backend.set_mapping(self.buttons)
+        log(f"applied profile {slug}")
+
+    def handle(self, req):
+        op = req.get("op")
+
+        if op == "status":
+            return {
+                "ok": True,
+                "version": DAEMON_VERSION,
+                "connected": self.backend is not None,
+                "backend": "software",
+                "active": self.active,
+                "profiles": [p["slug"] for p in prof.list_profiles()],
+                "buttons": describe(self.buttons),
+            }
+
+        if op == "profiles.list":
+            return {"ok": True, "profiles": prof.list_profiles(), "active": self.active}
+
+        if op == "profile.load":
+            slug = req["slug"]
+            self.apply(slug)
+            return {"ok": True, "active": self.active, "buttons": describe(self.buttons)}
+
+        if op == "profile.new":
+            base = req.get("base") or self.active
+            slug = prof.new_profile(req["name"], base=base)
+            if self.active is None:
+                self.apply(slug)
+            return {"ok": True, "slug": slug, "active": self.active}
+
+        if op == "profile.save":
+            slug = req["slug"]
+            data = prof.load(slug)
+            data["buttons"] = req.get("buttons", data.get("buttons", {}))
+            problems = prof.validate(data)
+            if problems:
+                return {"ok": False, "error": "; ".join(problems)}
+            prof.save(slug, data)
+            if slug == self.active:
+                self.apply(slug)
+            return {"ok": True, "slug": slug}
+
+        if op == "profile.rename":
+            old = req["slug"]
+            new = prof.new_profile(req["name"], base=old)
+            if self.active == old:
+                self.apply(new)
+            return {"ok": True, "slug": new}
+
+        if op == "profile.delete":
+            slug = req["slug"]
+            if slug == "default":
+                return {"ok": False, "error": "cannot delete the default profile"}
+            prof.delete(slug)
+            if self.active == slug:
+                self.apply("default")
+            return {"ok": True}
+
+        if op == "button.set":
+            bid = req["button"]
+            if bid not in BUTTON_ORDER:
+                return {"ok": False, "error": f"unknown button {bid}"}
+            action = {"type": req.get("type", "key"), "value": req.get("value")}
+            self.buttons[bid] = action
+            if self.active:
+                data = prof.load(self.active)
+                data.setdefault("buttons", {})[bid] = action
+                prof.save(self.active, data)
+            if self.backend:
+                self.backend.set_mapping(self.buttons)
+            return {"ok": True, "button": bid,
+                    "display": key_name(action.get("value"))}
+
+        if op == "button.reset":
+            bid = req["button"]
+            if bid not in BUTTON_ORDER:
+                return {"ok": False, "error": f"unknown button {bid}"}
+            from buttonmap import default_profile_buttons
+            self.buttons[bid] = default_profile_buttons()[bid]
+            if self.active:
+                data = prof.load(self.active)
+                data.setdefault("buttons", {})[bid] = self.buttons[bid]
+                prof.save(self.active, data)
+            if self.backend:
+                self.backend.set_mapping(self.buttons)
+            return {"ok": True, "display": key_name(self.buttons[bid]["value"])}
+
+        if op == "revert":
+            from buttonmap import default_profile_buttons
+            self.buttons = default_profile_buttons()
+            if self.active:
+                data = prof.load(self.active)
+                data["buttons"] = self.buttons
+                prof.save(self.active, data)
+            if self.backend:
+                self.backend.set_mapping(self.buttons)
+            return {"ok": True, "buttons": describe(self.buttons)}
+
+        if op == "capture":
+            globals()["_capture_mode"] = "key"
+            globals()["_captured"] = None
+            return {"ok": True, "capturing": True}
+
+        if op == "capture.poll":
+            globals()["_capture_mode"] = None
+            captured = globals()["_captured"]
+            return {"ok": True, "captured": captured,
+                    "display": key_name(captured) if captured is not None else None}
+
+        if op == "button.capture":
+            globals()["_capture_mode"] = "button"
+            globals()["_captured"] = None
+            return {"ok": True, "detecting": True}
+
+        if op == "button.capture.poll":
+            # Non-destructive while nothing has been pressed, so the panel can
+            # poll without cancelling the detection.
+            captured = globals()["_captured"]
+            bid = _button_for_code(captured) if captured is not None else None
+            if bid is not None:
+                globals()["_capture_mode"] = None
+                globals()["_captured"] = None
+            return {"ok": True, "button": bid, "code": captured}
+
+        if op == "button.capture.cancel":
+            globals()["_capture_mode"] = None
+            globals()["_captured"] = None
+            return {"ok": True}
+
+        if op == "debug.emit":
+            # Diagnostic: type a key through the daemon's own virtual device.
+            code = int(req.get("code", 8))
+            if self.backend:
+                self.backend._emit(EV_KEY, code, 1)
+                time.sleep(0.05)
+                self.backend._emit(EV_KEY, code, 0)
+                return {"ok": True, "code": code}
+            return {"ok": False, "error": "no backend"}
+
+        return {"ok": False, "error": f"unknown op {op!r}"}
+
+
+# ---------------------------------------------------------------------------
+# socket server
+# ---------------------------------------------------------------------------
+
+def serve(service):
+    if os.path.exists(SOCKET_PATH):
+        os.unlink(SOCKET_PATH)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(SOCKET_PATH)
+    os.chmod(SOCKET_PATH, 0o600)
+    srv.listen(8)
+    srv.settimeout(0.5)
+    log(f"listening on {SOCKET_PATH}")
+
+    while _running:
+        try:
+            conn, _addr = srv.accept()
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+        threading.Thread(target=handle_conn, args=(service, conn), daemon=True).start()
+
+    try:
+        srv.close()
+    except OSError:
+        pass
+    try:
+        os.unlink(SOCKET_PATH)
+    except OSError:
+        pass
+
+
+def handle_conn(service, conn):
+    with conn:
+        conn.settimeout(120.0)
+        buf = b""
+        try:
+            while True:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        req = json.loads(line)
+                    except ValueError as e:
+                        resp = {"ok": False, "error": f"bad json: {e}"}
+                    else:
+                        with _state_lock:
+                            try:
+                                resp = service.handle(req)
+                            except Exception as e:  # noqa: BLE001
+                                resp = {"ok": False, "error": str(e)}
+                    conn.sendall((json.dumps(resp) + "\n").encode())
+        except (socket.timeout, OSError):
+            pass
+
+
+# ---------------------------------------------------------------------------
+
+def shutdown(*_a):
+    global _running
+    _running = False
+
+
+def main():
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    prof.ensure_dirs()
+    if not prof.list_profiles():
+        prof.new_profile("Default")
+        # ensure the slug is "default"
+        data = prof.load("default")
+        prof.save("default", data)
+
+    service = Service()
+    service.start_backend()
+
+    active = prof.get_active() or "default"
+    try:
+        service.apply(active)
+    except Exception as e:  # noqa: BLE001
+        log(f"could not apply {active}: {e}; falling back to default")
+        try:
+            service.apply("default")
+        except Exception as e2:  # noqa: BLE001
+            log(f"default profile failed too: {e2}")
+
+    # pump thread for device events
+    def pump():
+        while _running:
+            if service.backend:
+                try:
+                    service.backend.pump(0.2)
+                except Exception as e:  # noqa: BLE001
+                    log(f"pump error: {e}; re-opening the mouse")
+                    service.backend.close()
+                    service.backend = None
+            else:
+                time.sleep(1)
+                if service.start_backend():
+                    try:
+                        service.apply(service.active or "default")
+                    except Exception as e:  # noqa: BLE001
+                        log(f"re-apply after reconnect failed: {e}")
+
+    threading.Thread(target=pump, daemon=True).start()
+
+    try:
+        serve(service)
+    finally:
+        if service.backend:
+            service.backend.close()
+        log("stopped")
+
+
+if __name__ == "__main__":
+    main()

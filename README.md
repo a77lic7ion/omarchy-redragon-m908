@@ -19,7 +19,9 @@ Plugin id: `redragon-m908`
 ## Requirements
 
 - Omarchy with the Quattro shell
-- A running `m908d` daemon (from the [m908-manager](https://github.com/shaunwg/m908-manager) project)
+- A running `m908d` daemon, **version 1.0.0**, whose full source ships in this
+  repository under [`daemon/`](daemon/) — see [daemon/README.md](daemon/README.md)
+  for install steps, privileges and trust boundaries
 - The Redragon M908 mouse connected
 
 ## Install
@@ -27,6 +29,25 @@ Plugin id: `redragon-m908`
 ```bash
 omarchy plugin add https://github.com/a77lic7ion/omarchy-redragon-m908.git --enable
 ```
+
+The panel only renders and edits mappings. The daemon that owns the device has to
+be running first; install it from [`daemon/`](daemon/README.md) (about a minute,
+no build step, standard library only).
+
+## The backend (m908d)
+
+`m908d` is not downloaded from anywhere. It is in this repository, pinned to the
+same commit as the panel, so what a reviewer reads is what runs.
+
+- `daemon/m908d` — entry point, JSON control socket, profile application
+- `daemon/backend.py` — grabs the mouse keypad node read-only and re-emits
+  remapped keys through a virtual uinput keyboard
+- `daemon/buttonmap.py` — the 13 button keycodes, read from the hardware
+- `daemon/profiles.py` — profile storage in `~/.config/m908`
+
+It runs as your user in a systemd user unit, needs no root, opens no network
+socket, never writes to the mouse, and listens on a 0600 socket in
+`$XDG_RUNTIME_DIR`. Full detail in [daemon/README.md](daemon/README.md).
 
 ## Usage
 

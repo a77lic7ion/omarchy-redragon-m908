@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "redragon-m908",
   "name": "Redragon M908",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "shaun",
   "license": "MIT",
   "description": "Button mapping and profiles for the Redragon M908 gaming mouse. 13 remappable buttons (12 side + top), saved as named profiles.",

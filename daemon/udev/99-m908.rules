@@ -1,0 +1,9 @@
+# Redragon M908 Impact (Holtek 04d9:fc4d) + the virtual keyboard m908d creates.
+#
+# m908d needs exactly two things:
+#   - read access to the mouse keypad event node (grabbed with EVIOCGRAB, read only)
+#   - write access to /dev/uinput, to create its virtual keyboard
+#
+# No hidraw access is granted: the daemon never writes to the mouse.
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"
+SUBSYSTEM=="input", KERNELS=="0003:04D9:FC4D.*", TAG+="uaccess"
